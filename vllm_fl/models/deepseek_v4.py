@@ -16,7 +16,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.deepseek_v4_attention import (
     DeepseekV4MLAModules,
     DeepseekV4MultiHeadLatentAttentionWrapper,
@@ -35,6 +35,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import (
@@ -66,10 +67,14 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm_fl.ops.deepseek_v4_attention import (
-    DeepseekV4Indexer,
+    DeepseekV4Indexer as DeepseekV4IndexerFP8,
+)
+from vllm_fl.ops.deepseek_v4_attention_bf16 import (
+    DeepseekV4Indexer as DeepseekV4IndexerBF16,
+    DeepseekV4MultiHeadLatentAttentionBF16Wrapper,
 )
 
-_DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
+_DEEPSEEK_V4_EXPERT_DTYPES = ("bf16", "fp4", "fp8")
 
 
 def _torch_post_process_fp8_weight_block_bmm(
@@ -154,6 +159,49 @@ class WOAColumnParallelLinear(ColumnParallelLinear):
             orig_fn(layer)
             if not getattr(layer, "is_bmm", False):
                 return
+            # Cutlass stores INT8 B as [K, N].  Materialize each wo_a output
+            # group's N slice now: a forward-time ``weight[:, start:end]`` is
+            # non-contiguous and forces the hot path onto the Triton fallback.
+            if (
+                hasattr(layer, "weight")
+                and layer.weight.dtype == torch.int8
+                and layer.weight.ndim == 2
+                and hasattr(layer, "weight_scale")
+            ):
+                g = layer.bmm_batch_size
+                rank = layer.weight.shape[1] // g
+                # Store physically contiguous [G, N_group, K].  Selecting a
+                # group and transposing gives a zero-copy [K, N_group] view
+                # with stride (1, K), exactly CUTLASS's column-major contract.
+                grouped_weight = layer.weight.T.view(
+                    g, rank, layer.weight.shape[0]
+                ).contiguous()
+                ws = layer.weight_scale
+                if ws.numel() == layer.weight.shape[1]:
+                    grouped_scale = ws.view(g, rank, *ws.shape[1:]).contiguous()
+                else:
+                    # Per-tensor weights: retain one scalar scale per group.
+                    grouped_scale = ws.reshape(1, *ws.shape).expand(
+                        g, *ws.shape
+                    ).contiguous()
+                layer.register_buffer(
+                    "_wo_a_grouped_weight", grouped_weight, persistent=False
+                )
+                layer.register_buffer(
+                    "_wo_a_grouped_weight_scale", grouped_scale,
+                    persistent=False,
+                )
+                return
+            # This grouped-BMM layout is exclusively for FP8 block weights
+            # consumed by fp8_einsum. INT W8A8 layers also expose ``weight``
+            # but their quantized Linear kernels require the original 2-D
+            # per-channel layout.
+            if (
+                not hasattr(layer, "weight")
+                or layer.weight.dtype != torch.float8_e4m3fn
+                or not hasattr(layer, "weight_scale_inv")
+            ):
+                return
             w = layer.weight
             if w.ndim != 2:
                 # Already reshaped by the kernel (e.g. DeepGemm kernel)
@@ -163,8 +211,17 @@ class WOAColumnParallelLinear(ColumnParallelLinear):
             ws = getattr(layer, "weight_scale_inv", None)
             scale_attr = "weight_scale_inv"
             if ws is None:
-                ws = layer.weight_scale
+                ws = getattr(layer, "weight_scale", None)
                 scale_attr = "weight_scale"
+            if ws is None:
+                # Unquantized BF16 wo_a still needs the grouped-BMM weight
+                # layout, but has no FP8 scale tensor to post-process.
+                replace_parameter(
+                    layer,
+                    "weight",
+                    w.view(g, w.size(0) // g, w.size(1)),
+                )
+                return
 
             block_size = getattr(layer, "weight_block_size", [128, 128])
             candidates = get_default_manager().resolve_candidates(
@@ -246,8 +303,7 @@ class DeepseekV4MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         if swiglu_limit is not None:
-            from vllm_fl.ops.activation import SiluAndMulWithClampFL
-            self.act_fn = SiluAndMulWithClampFL(swiglu_limit)
+            self.act_fn = SiluAndMulWithClamp(swiglu_limit)
         else:
             self.act_fn = SiluAndMul()
 
@@ -311,7 +367,7 @@ class DeepseekV4FP8Config(Fp8Config):
     def is_scale_e8m0(self) -> bool:
         # FP4 checkpoints store FP8 linear scales as e8m0fnu; FP8 expert
         # checkpoints (Flash-Base) store them as float32.
-        return self.expert_dtype == "fp4"
+        return self.expert_dtype in ("bf16", "fp4")
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -341,6 +397,8 @@ class DeepseekV4FP8Config(Fp8Config):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
                 return Mxfp4MoEMethod(layer.moe_config)
+            if self.expert_dtype == "bf16":
+                return UnquantizedFusedMoEMethod(layer.moe_config)
             # expert_dtype == "fp8": fall through to Fp8Config which
             # returns Fp8MoEMethod with block-wise float32 scales.
         return super().get_quant_method(layer, prefix)
@@ -1146,7 +1204,15 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{prefix}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
-        self.scale_fmt = config.quantization_config["scale_fmt"]
+        # ``scale_fmt`` is a DeepSeek FP8 checkpoint extension.  Standard
+        # compressed-tensors checkpoints (including W8A16/W4A16 INT models)
+        # do not define it, and the attention wrapper does not require it.
+        quantization_config = getattr(config, "quantization_config", None)
+        self.scale_fmt = (
+            quantization_config.get("scale_fmt")
+            if isinstance(quantization_config, dict)
+            else None
+        )
 
         self.rope_parameters = config.rope_scaling
 
@@ -1175,7 +1241,12 @@ class DeepseekV4Attention(nn.Module):
         self.indexer = None
         if self.compress_ratio == 4:
             # Only C4A uses sparse attention and hence has indexer.
-            self.indexer = DeepseekV4Indexer(
+            indexer_cls = (
+                DeepseekV4IndexerBF16
+                if getattr(config, "expert_dtype", "fp4") == "bf16"
+                else DeepseekV4IndexerFP8
+            )
+            self.indexer = indexer_cls(
                 vllm_config,
                 config=config,
                 hidden_size=self.hidden_size,
@@ -1202,7 +1273,17 @@ class DeepseekV4Attention(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
-        self.mla_attn = DeepseekV4MultiHeadLatentAttentionWrapper(
+        # MLA precision follows the projection's effective quantization method,
+        # independently of the experts' quantization format.
+        use_bf16_attention = isinstance(
+            self.wo_a.quant_method, UnquantizedLinearMethod
+        )
+        attention_wrapper_cls = (
+            DeepseekV4MultiHeadLatentAttentionBF16Wrapper
+            if use_bf16_attention
+            else DeepseekV4MultiHeadLatentAttentionWrapper
+        )
+        self.mla_attn = attention_wrapper_cls(
             hidden_size=self.hidden_size,
             num_heads=self.n_local_heads,
             head_dim=self.head_dim,
@@ -1364,7 +1445,6 @@ class DeepseekV4DecoderLayer(nn.Module):
 class DeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
@@ -1544,14 +1624,23 @@ class DeepseekV4Model(nn.Module):
                         weight_loader = typing.cast(
                             Callable[..., bool], param.weight_loader
                         )
-                        success = weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
+                        try:
+                            success = weight_loader(
+                                param,
+                                loaded_weight,
+                                name_mapped,
+                                shard_id=shard_id,
+                                expert_id=expert_id,
+                                return_success=True,
+                            )
+                        except RuntimeError as exc:
+                            raise RuntimeError(
+                                "Failed loading expert weight "
+                                f"{name!r} -> {name_mapped!r}, "
+                                f"shard={shard_id!r}, expert={expert_id}, "
+                                f"source_shape={tuple(loaded_weight.shape)}, "
+                                f"param_shape={tuple(param.shape)}"
+                            ) from exc
                         if success:
                             name = name_mapped
                             break
@@ -1719,6 +1808,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
+        for module in self.model.modules():
+            refresh = getattr(module, "_refresh_combined_compressor_weight", None)
+            if refresh is not None:
+                refresh()
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

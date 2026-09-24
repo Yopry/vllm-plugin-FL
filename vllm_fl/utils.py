@@ -47,8 +47,12 @@ VENDOR_DEVICE_MAP: dict[str, dict[str, str]] = {
     "hygon": {"device_type": "cuda", "device_name": "cuda"},
     # Registered backend: vendor/thead (PPU)
     "thead": {"device_type": "cuda", "device_name": "thead"},
+    # Registered backend: vendor/gcu (Enflame GCU / torch_gcu)
+    "enflame": {"device_type": "gcu", "device_name": "gcu"},
     # Registered backend: vendor/txda
     "tsingmicro": {"device_type": "txda", "device_name": "txda"},
+    # Registered backend: vendor/kunlunxin
+    "kunlunxin": {"device_type": "cuda", "device_name": "kunlunxin"},
 }
 
 
@@ -104,7 +108,7 @@ def get_flag_gems_whitelist_blacklist() -> Tuple[
     Priority (highest to lowest):
     1. VLLM_FL_FLAGOS_WHITELIST env var: Only these ops use FlagGems
     2. VLLM_FL_FLAGOS_BLACKLIST env var: These ops don't use FlagGems
-    3. Platform config flagos_blacklist: Default blacklist from config file
+    3. Model/platform config flagos_whitelist or flagos_blacklist
 
     Note: VLLM_FL_FLAGOS_WHITELIST and VLLM_FL_FLAGOS_BLACKLIST cannot be set
     simultaneously. If whitelist is set, it completely overrides any blacklist.
@@ -140,9 +144,16 @@ def get_flag_gems_whitelist_blacklist() -> Tuple[
         blacklist = [op.strip() for op in blacklist_str.split(",") if op.strip()]
         return None, blacklist
 
-    # Priority 3: Blacklist from platform config
+    # Priority 3: Whitelist or blacklist from model/platform config
     try:
-        from vllm_fl.dispatch.config import get_flagos_blacklist
+        from vllm_fl.dispatch.config import (
+            get_flagos_blacklist,
+            get_flagos_whitelist,
+        )
+
+        config_whitelist = get_flagos_whitelist()
+        if config_whitelist:
+            return config_whitelist, None
 
         config_blacklist = get_flagos_blacklist()
         if config_blacklist:
@@ -160,7 +171,7 @@ def use_flaggems_op(op_name: str, default: bool = True) -> bool:
     Priority (highest to lowest):
     1. VLLM_FL_FLAGOS_WHITELIST env var: Only these ops use FlagGems
     2. VLLM_FL_FLAGOS_BLACKLIST env var: These ops don't use FlagGems
-    3. Platform config flagos_blacklist: Default blacklist from config file
+    3. Model/platform config flagos_whitelist or flagos_blacklist
     4. Default: Use FlagGems for all ops
 
     Note: Whitelist and blacklist (env vars) cannot be set simultaneously.
@@ -217,7 +228,7 @@ _load_op_config_from_env()
 class DeviceInfo:
     def __init__(self):
         self.device = DeviceDetector()
-        self.supported_device = ["nvidia", "ascend", "metax", "mthreads", "sunrise", "thead"]
+        self.supported_device = ["nvidia", "ascend", "metax", "mthreads", "sunrise", "thead", "gcu", "kunlunxin"]
         backend.set_torch_backend_device_fn(self.device.vendor_name)
 
     @property

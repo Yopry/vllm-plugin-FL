@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Optional, Union
 
 import torch
+import os
 
 from vllm_fl.dispatch.backends.base import Backend
 
@@ -76,6 +77,28 @@ class FlagGemsBackend(Backend):
             args[9] = quant_type_map[quant_type_id]
 
         return fused_marlin_moe(*args, **kwargs)
+
+    def cutlass_scaled_mm(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        scale_a: torch.Tensor,
+        scale_b: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run FlagGems' CUTLASS scaled GEMM."""
+        import flag_gems
+
+        target_shape = (*a.shape[:-1], b.shape[1])
+        a = a.view(-1, a.shape[-1])
+        out = torch.empty(
+            (a.shape[0], b.shape[1]),
+            dtype=out_dtype,
+            device=a.device,
+        )
+        flag_gems.cutlass_scaled_mm(out, a, b, scale_a, scale_b, bias)
+        return out.view(*target_shape)
 
     def router_gemm_bf16_fp32(
         self, x: torch.Tensor, weight: torch.Tensor
@@ -206,7 +229,14 @@ class FlagGemsBackend(Backend):
 
         if use_sparse:
             raise ValueError("use_sparse=True requires use_mla=True.")
-        # TODO: return "vllm_fl.dispatch.backends.flaggems.impl.attention.AttentionFLBackend"
+
+        use_flaggems_attn = os.environ.get(
+            "VLLM_FL_USE_FLAGGEMS_ATTN", "0"
+        ).lower() in ("1", "true", "yes")
+
+        if use_flaggems_attn:
+            print("Using FlagGems attention backend.")
+            return "vllm_fl.dispatch.backends.flaggems.impl.attention.AttentionFLBackend"
 
         return AttentionBackendEnum.TRITON_ATTN.get_path()
 
@@ -666,4 +696,34 @@ class FlagGemsBackend(Backend):
         from .impl.deepseek_v4_attn import flash_mla_sparse_fwd_flaggems
         return flash_mla_sparse_fwd_flaggems(
             q, kv, indices, sm_scale, attn_sink, topk_length, out,
+        )
+
+    def gather_bf16_kv_from_pages(
+        self,
+        kv_cache,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        total_seq_lens,
+        dst=None,
+    ):
+        from .impl.deepseek_v4_ops import gather_bf16_kv_from_pages_flaggems
+
+        return gather_bf16_kv_from_pages_flaggems(
+            kv_cache, block_table, cu_seq_lens, token_to_seq, total_seq_lens, dst
+        )
+
+    def bf16_mqa_logits(
+        self,
+        q,
+        kv,
+        weights,
+        cu_seq_len_k_start,
+        cu_seq_len_k_end,
+        clean_logits=True,
+    ):
+        from .impl.deepseek_v4_ops import bf16_mqa_logits_flaggems
+
+        return bf16_mqa_logits_flaggems(
+            q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits
         )

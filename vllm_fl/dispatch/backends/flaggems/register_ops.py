@@ -57,6 +57,17 @@ def register_builtins(registry) -> None:
                kind=BackendImplKind.DEFAULT,
                fn=_bind_is_available(backend.fused_marlin_moe, is_avail),
                vendor=None, priority=BackendPriority.DEFAULT),
+        OpImpl(
+            op_name="cutlass_scaled_mm",
+            impl_id="default.flagos",
+            kind=BackendImplKind.DEFAULT,
+            fn=_bind_is_available(
+                backend.cutlass_scaled_mm,
+                _has_flaggems_op("cutlass_scaled_mm"),
+            ),
+            vendor=None,
+            priority=BackendPriority.DEFAULT,
+        ),
         # MoE router GEMM (BF16 inputs, FP32 output)
         OpImpl(
             op_name="router_gemm_bf16_fp32",
@@ -349,6 +360,22 @@ def register_builtins(registry) -> None:
             impl_id="default.flagos",
             kind=BackendImplKind.DEFAULT,
             fn=_bind_is_available(backend.flash_mla_sparse_fwd, is_avail),
+            vendor=None,
+            priority=BackendPriority.DEFAULT,
+        ),
+        OpImpl(
+            op_name="gather_bf16_kv_from_pages",
+            impl_id="default.flagos",
+            kind=BackendImplKind.DEFAULT,
+            fn=_bind_is_available(backend.gather_bf16_kv_from_pages, is_avail),
+            vendor=None,
+            priority=BackendPriority.DEFAULT,
+        ),
+        OpImpl(
+            op_name="bf16_mqa_logits",
+            impl_id="default.flagos",
+            kind=BackendImplKind.DEFAULT,
+            fn=_bind_is_available(backend.bf16_mqa_logits, is_avail),
             vendor=None,
             priority=BackendPriority.DEFAULT,
         ),
